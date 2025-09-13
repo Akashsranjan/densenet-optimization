@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  benchmark-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - ./logs:/app/logs
+    environment:
+      - BATCH_SIZES=1,4,8,16,32
+    command: ["python3", "src/main.py"]
+
+  tensorboard:
+    image: tensorflow/tensorboard:latest
+    ports:
+      - "6006:6006"
+    volumes:
+      - ./logs/tensorboard:/app/logs/tensorboard
+    command: ["tensorboard", "--logdir", "/app/logs/tensorboard", "--bind_all"]
