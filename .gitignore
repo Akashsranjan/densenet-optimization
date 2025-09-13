@@ -1,0 +1,8 @@
+# .gitignore
+
+# Ignore the virtual environment directory
+venv/
+
+# Ignore common artifacts
+__pycache__/
+*.pyc
