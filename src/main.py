@@ -196,38 +196,42 @@ def main():
             model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
             model.eval()
 
+            # Set the device for this specific optimization
+            current_device = DEVICE
+            if opt == "dynamic_quant":
+                current_device = torch.device("cpu")
+            
+            # Apply the specific optimization
             if opt == "none":
-                model.to(DEVICE)
+                model.to(current_device)
             elif opt == "fp16":
                 model.to(DEVICE)
             elif opt == "prune":
                 for name, module in model.named_modules():
                     if isinstance(module, nn.Conv2d):
                         prune.l1_unstructured(module, name="weight", amount=0.3)
-                model.to(DEVICE)
+                model.to(current_device)
             elif opt == "dynamic_quant":
-                model = torch.quantization.quantize_dynamic(model.to("cpu"), {nn.Linear}, dtype=torch.qint8)
-                model.to(DEVICE)
+                model = torch.quantization.quantize_dynamic(model.to(current_device), {nn.Linear}, dtype=torch.qint8)
             elif opt == "script":
                 model = torch.jit.script(model)
-                model.to(DEVICE)
+                model.to(current_device)
             
+            # Run the benchmark and append to the single CSV file
             with open(csv_path, 'a', newline='') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 for batch_size in BATCH_SIZES:
                     use_autocast = opt == "fp16"
-                    results = benchmark_model(model, batch_size, f"densenet121_{opt}", DEVICE, LOG_DIR, opt, use_autocast)
+                    results = benchmark_model(model, batch_size, f"densenet121_{opt}", current_device, LOG_DIR, opt, use_autocast)
                     writer.writerow(results)
 
-            save_model_checkpoint(model, "densenet121", opt, DEVICE)
+            save_model_checkpoint(model, "densenet121", opt, current_device)
 
             print(f"Benchmarking complete for {opt}. Results written to {csv_path}")
 
         except Exception as e:
             print(f" Error during {opt} benchmark: {e}")
             print("Skipping this optimization...")
-
-    print("\nAll benchmarks complete.")
 
 if __name__ == "__main__":
     main()

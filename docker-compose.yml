@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     deploy:
       resources:
+        limits:
+          memory: 6g 
         reservations:
           devices:
             - driver: nvidia
