@@ -20,7 +20,7 @@ ENV PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
 WORKDIR /app
 
 COPY requirements.txt .
-RUN uv sync
+RUN uv pip install --system -r requirements.txt
 
 COPY src ./src
 

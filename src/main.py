@@ -7,13 +7,15 @@ import time
 import os
 import csv
 import psutil
-from typing import List, Dict, Any
+import torch.nn.utils.prune as prune
+from torch.cuda.amp import autocast
+import copy
+from typing import Dict, Any
 
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "results")
 LOG_DIR = os.environ.get("LOG_DIR", "logs")
-BATCH_SIZES = [int(x) for x in os.environ.get("BATCH_SIZES", "1,4,8,16,32").split(',')]
-
+BATCH_SIZES = [int(x) for x in os.environ.get("BATCH_SIZES", "1,4,8,16").split(',')]
 
 def get_device() -> torch.device:
     """Detect and return the appropriate device (GPU or CPU)."""
@@ -41,14 +43,12 @@ def get_gpu_metrics() -> Dict[str, float]:
             gpu_util = util.gpu
             vram_used = pynvml.nvmlDeviceGetMemoryInfo(handle).used
             pynvml.nvmlShutdown()
-
             return {
                 'vram_usage_mb': vram_used / (1024 ** 2),
                 'vram_peak_mb': torch.cuda.max_memory_allocated() / (1024 ** 2),
                 'gpu_utilization_pct': gpu_util
             }
         except Exception as e:
-            # Fallback in case pynvml is not available or an error occurs
             print(f"Warning: Could not get full GPU metrics with pynvml. Reason: {e}")
             return {
                 'vram_usage_mb': torch.cuda.memory_allocated() / (1024 ** 2),
@@ -71,20 +71,25 @@ def get_model_size_mb(model: nn.Module) -> float:
         buffer_size += buffer.nelement() * buffer.element_size()
     return (param_size + buffer_size) / (1024**2)
 
-
-# Benchmarking Core Function
-def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, device: torch.device, output_dir: str, log_dir: str) -> Dict[str, Any]:
+def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, device: torch.device, log_dir: str, optimization_technique: str, use_autocast: bool = False) -> Dict[str, Any]:
     """
     Benchmarks a given model for a specific batch size and logs results.
     """
-    print(f"Benchmarking: {model_variant}, Batch Size: {batch_size}, Device: {device}")
+    print(f"Benchmarking: {model_variant}, Batch Size: {batch_size}, Device: {device}, Optimization: {optimization_technique}")
 
-    dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
+    if use_autocast:
+        dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
+    else:
+        dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
 
-    writer = SummaryWriter(os.path.join(log_dir, f"{model_variant}_{batch_size}"))
+    writer = SummaryWriter(os.path.join(log_dir, f"{model_variant}_{batch_size}_{optimization_technique}"))
 
     for _ in range(3):
-        _ = model(dummy_input)
+        if use_autocast:
+            with autocast():
+                _ = model(dummy_input)
+        else:
+            _ = model(dummy_input)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -96,7 +101,7 @@ def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, devic
             ProfilerActivity.CUDA if device.type == 'cuda' else ProfilerActivity.CPU
         ],
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(log_dir, f"{model_variant}_{batch_size}")),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(log_dir, f"{model_variant}_{batch_size}_{optimization_technique}")),
         profile_memory=True,
         record_shapes=True,
         with_stack=True
@@ -104,7 +109,11 @@ def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, devic
         start_time = time.time()
         for step in range(5):
             with record_function(f"model_inference_batch_{step}"):
-                _ = model(dummy_input)
+                if use_autocast:
+                    with autocast():
+                        _ = model(dummy_input)
+                else:
+                    _ = model(dummy_input)
             prof.step()
         end_time = time.time()
 
@@ -135,7 +144,7 @@ def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, devic
         'accuracy_top1': accuracy_top1,
         'accuracy_top5': accuracy_top5,
         'model_size_mb': get_model_size_mb(model),
-        'optimization_technique': 'None'
+        'optimization_technique': optimization_technique
     }
 
     return benchmark_data
@@ -146,10 +155,7 @@ def main():
     DEVICE = get_device()
     print(f"Using device: {DEVICE}")
 
-    print("Loading baseline DenseNet-121 model...")
-    model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
-    model.eval()
-    model.to(DEVICE)
+    optimizations = ["none", "fp16", "prune", "dynamic_quant", "script"]
 
     csv_path = os.path.join(OUTPUT_DIR, "benchmark_results.csv")
     fieldnames = [
@@ -163,13 +169,44 @@ def main():
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-    for batch_size in BATCH_SIZES:
-        results = benchmark_model(model, batch_size, "densenet121_baseline", DEVICE, OUTPUT_DIR, os.path.join(LOG_DIR, "tensorboard"))
-        with open(csv_path, 'a', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writerow(results)
+    for opt in optimizations:
+        try:
+            print(f"\n--- Running {opt.upper()} Benchmark ---")
+            
+            model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+            model.eval()
 
-    print("\nBaseline benchmarking complete. Results saved to benchmark_results.csv and TensorBoard logs.")
+            if opt == "none":
+                model.to(DEVICE)
+            elif opt == "fp16":
+                model.to(DEVICE)
+            elif opt == "prune":
+                for name, module in model.named_modules():
+                    if isinstance(module, nn.Conv2d):
+                        prune.l1_unstructured(module, name="weight", amount=0.3)
+                model.to(DEVICE)
+            elif opt == "dynamic_quant":
+                model = torch.quantization.quantize_dynamic(model.to("cpu"), {nn.Linear}, dtype=torch.qint8)
+                model.to(DEVICE)
+            elif opt == "script":
+                model = torch.jit.script(model)
+                model.to(DEVICE)
+            
+
+            with open(csv_path, 'a', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                for batch_size in BATCH_SIZES:
+                    use_autocast = opt == "fp16"
+                    results = benchmark_model(model, batch_size, f"densenet121_{opt}", DEVICE, LOG_DIR, opt, use_autocast)
+                    writer.writerow(results)
+
+            print(f"Benchmarking complete for {opt}. Results written to {csv_path}")
+
+        except Exception as e:
+            print(f" Error during {opt} benchmark: {e}")
+            print("Skipping this optimization...")
+
+    print("\nAll benchmarks complete.")
 
 if __name__ == "__main__":
     main()
