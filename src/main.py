@@ -12,7 +12,6 @@ from torch.cuda.amp import autocast
 import copy
 from typing import Dict, Any
 
-
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "results")
 LOG_DIR = os.environ.get("LOG_DIR", "logs")
 BATCH_SIZES = [int(x) for x in os.environ.get("BATCH_SIZES", "1,4,8,16").split(',')]
@@ -71,6 +70,21 @@ def get_model_size_mb(model: nn.Module) -> float:
         buffer_size += buffer.nelement() * buffer.element_size()
     return (param_size + buffer_size) / (1024**2)
 
+def save_model_checkpoint(model: nn.Module, model_variant: str, optimization_technique: str, device: torch.device):
+    """Saves the optimized model as a checkpoint."""
+    models_dir = os.path.join(OUTPUT_DIR, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    filename = f"{model_variant}_{optimization_technique}.pth"
+    filepath = os.path.join(models_dir, filename)
+
+    if isinstance(model, torch.jit.ScriptModule):
+        model = model.cpu()
+        torch.jit.save(model, filepath)
+    else:
+        torch.save(model.state_dict(), filepath)
+
+    print(f"Model checkpoint saved to {filepath}")
+
 def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, device: torch.device, log_dir: str, optimization_technique: str, use_autocast: bool = False) -> Dict[str, Any]:
     """
     Benchmarks a given model for a specific batch size and logs results.
@@ -81,6 +95,9 @@ def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, devic
         dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
     else:
         dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
+
+    profiler_dir = os.path.join(OUTPUT_DIR, "profiles", f"{model_variant}_{optimization_technique}")
+    os.makedirs(profiler_dir, exist_ok=True)
 
     writer = SummaryWriter(os.path.join(log_dir, f"{model_variant}_{batch_size}_{optimization_technique}"))
 
@@ -101,7 +118,7 @@ def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, devic
             ProfilerActivity.CUDA if device.type == 'cuda' else ProfilerActivity.CPU
         ],
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(log_dir, f"{model_variant}_{batch_size}_{optimization_technique}")),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_dir),
         profile_memory=True,
         record_shapes=True,
         with_stack=True
@@ -149,13 +166,16 @@ def benchmark_model(model: nn.Module, batch_size: int, model_variant: str, devic
 
     return benchmark_data
 
-
 def main():
     """Main function to run the entire benchmarking suite."""
     DEVICE = get_device()
     print(f"Using device: {DEVICE}")
 
     optimizations = ["none", "fp16", "prune", "dynamic_quant", "script"]
+
+    os.makedirs(os.path.join(LOG_DIR), exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "profiles"), exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "models"), exist_ok=True)
 
     csv_path = os.path.join(OUTPUT_DIR, "benchmark_results.csv")
     fieldnames = [
@@ -192,13 +212,14 @@ def main():
                 model = torch.jit.script(model)
                 model.to(DEVICE)
             
-
             with open(csv_path, 'a', newline='') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 for batch_size in BATCH_SIZES:
                     use_autocast = opt == "fp16"
                     results = benchmark_model(model, batch_size, f"densenet121_{opt}", DEVICE, LOG_DIR, opt, use_autocast)
                     writer.writerow(results)
+
+            save_model_checkpoint(model, "densenet121", opt, DEVICE)
 
             print(f"Benchmarking complete for {opt}. Results written to {csv_path}")
 
